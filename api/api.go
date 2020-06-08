@@ -17,6 +17,7 @@ import (
 	apiv1 "k8s.io/api/core/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
@@ -25,6 +26,10 @@ type WorkerSpecs struct {
 	WorkerId int `json:"workerId"`
 	TotalWorkers int `json:"nWorkers"`
 	InputFolderPath string `json:"inputFolderPath"`
+}
+
+type UidSpec struct {
+	Uid string `json:"uid"`
 }
 
 type JobDetails struct {
@@ -48,10 +53,15 @@ func main() {
 	jobDetailsMap = make(map[string]*JobDetails)
 	http.HandleFunc("/create", createJob)
 	http.HandleFunc("/init", initWorker)
+	http.HandleFunc("/status", jobStatus)
 	http.HandleFunc("/write-chunk", writeChunk)
-	if err := http.ListenAndServe(":8000", nil); err != nil {
-		panic(err)
+	http.HandleFunc("/delete", deleteJob)
+	server := &http.Server{
+		ReadTimeout: 1 * time.Minute,
+		WriteTimeout: 10 * time.Minute,
+		Addr:":8000",
 	}
+	server.ListenAndServe()
 }
 
 func generateUid() string {
@@ -93,7 +103,10 @@ func createJob(w http.ResponseWriter, r* http.Request) {
 			accessToken: accessToken,
 		}
 		createJobHelper(jobDetailsMap[uid])
-		jobStatus(w, uid)
+		uidSpec := &UidSpec{
+			Uid: uid,
+		}
+		json.NewEncoder(w).Encode(uidSpec)
 	}
 }
 
@@ -127,6 +140,11 @@ func createJobHelper(jobDetails *JobDetails) {
 									Value: jobDetails.accessToken,
 								},
 							},
+							Resources: apiv1.ResourceRequirements{
+								Requests: apiv1.ResourceList{
+									apiv1.ResourceCPU: resource.MustParse("1"),
+								},
+							},
 
 						},
 					},
@@ -145,7 +163,8 @@ func createJobHelper(jobDetails *JobDetails) {
 	fmt.Printf("Created Job %q.\n", result.GetObjectMeta().GetName())
 }
 
-func jobStatus(w http.ResponseWriter, uid string) {
+func jobStatus(w http.ResponseWriter, r *http.Request) {
+	uid := r.URL.Query().Get("uid")
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "Streaming unsupported!", http.StatusInternalServerError)
@@ -265,5 +284,31 @@ func uploadToCDrive(localPath, cDrivePath, accessToken string) {
 	_ , err = ioutil.ReadAll(response.Body)
 	if err != nil {
 		panic(err)
+	}
+}
+
+func deleteJob(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, "Could not parse form.", http.StatusBadRequest)
+			return
+		}
+		uid := r.PostForm.Get("uid")
+
+		deletePolicy := metav1.DeletePropagationForeground
+
+		config, err := rest.InClusterConfig()
+		if err != nil {
+			panic(err.Error())
+		}
+
+		clientset, err := kubernetes.NewForConfig(config)
+		if err != nil {
+			panic(err.Error())
+		}
+		jobDetails := jobDetailsMap[uid]
+		jobsClient := clientset.BatchV1().Jobs(apiv1.NamespaceDefault)
+		_ = jobsClient.Delete(jobDetails.JobName, &metav1.DeleteOptions{PropagationPolicy: &deletePolicy})
+		delete(jobDetailsMap, uid)
 	}
 }
